@@ -4,9 +4,11 @@ import (
 	"context"
 	"log"
 	"time"
+	"io/ioutil"
+	"net/http"
+	"os"
 
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/wrappers"
+	"github.com/golang/protobuf/proto"
 
 	"github.com/mongodb/mongo-go-driver/bson"
 	"github.com/mongodb/mongo-go-driver/mongo"
@@ -16,6 +18,27 @@ import (
 )
 
 func main() {
+	httpClient := &http.Client{}
+	req, _ := http.NewRequest("GET", "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/sydneytrains", nil)
+
+	if transportAPIKey, exists := os.LookupEnv("TRANSPORT_API_KEY"); exists {
+		req.Header.Add("Authorization", "apikey " + transportAPIKey)
+	} else {
+		err := "Must set environment variable TRANSPORT_API_KEY"
+		log.Fatalln(err)
+		panic(err)
+	}
+
+	feedMessage := &FeedMessage{}
+	if response, err := httpClient.Do(req); err != nil {
+		panic(err)
+	} else {
+		data, _ := ioutil.ReadAll(response.Body)
+		if err := proto.Unmarshal(data, feedMessage); err != nil {
+			log.Fatalln("Failed to parse FeedMessage:", err)
+		}
+	}
+
 	log.Printf("connecting to MongoDB...")
 
 	// Register custom codecs for protobuf Timestamp and wrapper types
@@ -24,7 +47,15 @@ func main() {
 	// Create MongoDB client with registered custom codecs for protobuf Timestamp and wrapper types
 	// NOTE: "mongodb+srv" protocol means connect to Altas cloud MongoDB server
 	//       use just "mongodb" if you connect to on-premise MongoDB server
-	client, err := mongo.NewClientWithOptions("mongodb+srv://USER:PASSWORD@SERVER/experiments",
+	mongoDbURL, exists := os.LookupEnv("MONGO_DB_URL")
+
+	if !exists {
+		err := "Must set environment variable MONGO_DB_URL"
+		log.Fatalln(err)
+		panic(err)
+	}
+
+	client, err := mongo.NewClientWithOptions(mongoDbURL,
 		&options.ClientOptions{
 			Registry: reg,
 		})
@@ -43,49 +74,17 @@ func main() {
 	log.Printf("connected successfully")
 
 	// Get collection from database
-	coll := client.Database("experiments").Collection("proto")
+	coll := client.Database("sydneytrains").Collection("vehiclepos")
 
-	// Create protobuf Timestamp value from golang Time
-	t := time.Now()
-	ts, err := ptypes.TimestampProto(t)
-	if err != nil {
-		log.Fatalf("failed to convert golang Time to protobuf Timestamp: %#v", err)
-	}
-
-	// Fill in data structure
-	in := Data{
-		BoolValue:   true,
-		Int64Value:  12345,
-		DoubleValue: 123.45,
-		StringValue: "qwerty",
-
-		TimestampValue: ts,
-
-		BoolWrappedValue:   &wrappers.BoolValue{Value: true},
-		Int64WrappedValue:  &wrappers.Int64Value{Value: 12345},
-		DoubleWrappedValue: &wrappers.DoubleValue{Value: 123.45},
-		StringWrappedValue: &wrappers.StringValue{Value: "qwerty"},
-	}
-
-	log.Printf("insert data into collection <experiments.proto>...")
+	log.Printf("insert data into collection <sydneytrains.vehiclepos>...")
 
 	// Insert data into the collection
-	res, err := coll.InsertOne(ctx, &in)
-	if err != nil {
-		log.Fatalf("insert data into collection <experiments.proto>: %#v", err)
+	for _, element := range feedMessage.GetEntity() {
+		res, err := coll.InsertOne(ctx, &element)
+		if err != nil {
+			log.Fatalf("insert data into collection <sydneytrains.vehiclepos>: %#v", err)
+		}
+		id := res.InsertedID
+		log.Printf("inserted new item with id=%v successfully", id)
 	}
-	id := res.InsertedID
-	log.Printf("inserted new item with id=%v successfully", id)
-
-	// Create filter and output structure to read data from collection
-	var out Data
-	filter := bson.D{{Key: "_id", Value: id}}
-
-	// Read data from collection
-	err = coll.FindOne(ctx, filter).Decode(&out)
-	if err != nil {
-		log.Fatalf("failed to read data (id=%v) from collection <experiments.proto>: %#v", id, err)
-	}
-
-	log.Print("read successfully")
 }
